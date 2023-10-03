@@ -75,6 +75,8 @@ class SqliteDb:
     def close(self) -> None:
         """If needed, close the connection."""
         if self.con is not None and self.filename != ":memory:":
+            if self.debug.should("sql"):
+                self.debug.write(f"Closing {self.con!r} on {self.filename!r}")
             self.con.close()
             self.con = None
 
