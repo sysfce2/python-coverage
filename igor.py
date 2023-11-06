@@ -103,30 +103,35 @@ def do_remove_extension(*args):
                         print(f"Couldn't remove {filename}: {exc}")
 
 
-def label_for_tracer(tracer):
+def label_for_core(core):
     """Get the label for these tests."""
-    if tracer == "py":
-        label = "with Python tracer"
+    if core == "pytrace":
+        return "with Python tracer"
+    elif core == "ctrace":
+        return "with C tracer"
+    elif core == "sysmon":
+        return "with sys.monitoring"
     else:
-        label = "with C tracer"
-
-    return label
+        raise ValueError(f"Bad core: {core!r}")
 
 
-def should_skip(tracer):
+def should_skip(core):
     """Is there a reason to skip these tests?"""
     skipper = ""
 
-    # $set_env.py: COVERAGE_ONE_TRACER - Only run tests for one tracer.
-    only_one = os.environ.get("COVERAGE_ONE_TRACER")
+    # $set_env.py: COVERAGE_ONE_CORE - Only run tests for one core.
+    only_one = os.environ.get("COVERAGE_ONE_CORE")
     if only_one:
         if CPYTHON:
-            if tracer == "py":
-                skipper = "Only one tracer: no Python tracer for CPython"
+            if sys.version_info >= (3, 12):
+                if core != "sysmon":
+                    skipper = f"Only one core: not running {core}"
+            elif core != "ctrace":
+                skipper = f"Only one core: not running {core}"
         else:
-            if tracer == "c":
-                skipper = f"No C tracer for {platform.python_implementation()}"
-    elif tracer == "py":
+            if core != "pytrace":
+                skipper = f"No C core for {platform.python_implementation()}"
+    elif core == "pytrace":
         # $set_env.py: COVERAGE_NO_PYTRACER - Don't run the tests under the Python tracer.
         skipper = os.environ.get("COVERAGE_NO_PYTRACER")
     else:
@@ -134,7 +139,7 @@ def should_skip(tracer):
         skipper = os.environ.get("COVERAGE_NO_CTRACER")
 
     if skipper:
-        msg = "Skipping tests " + label_for_tracer(tracer)
+        msg = "Skipping tests " + label_for_core(core)
         if len(skipper) > 1:
             msg += ": " + skipper
     else:
@@ -143,26 +148,26 @@ def should_skip(tracer):
     return msg
 
 
-def make_env_id(tracer):
+def make_env_id(core):
     """An environment id that will keep all the test runs distinct."""
     impl = platform.python_implementation().lower()
     version = "%s%s" % sys.version_info[:2]
     if PYPY:
         version += "_%s%s" % sys.pypy_version_info[:2]
-    env_id = f"{impl}{version}_{tracer}"
+    env_id = f"{impl}{version}_{core}"
     return env_id
 
 
-def run_tests(tracer, *runner_args):
+def run_tests(core, *runner_args):
     """The actual running of tests."""
     if "COVERAGE_TESTING" not in os.environ:
         os.environ["COVERAGE_TESTING"] = "True"
-    print_banner(label_for_tracer(tracer))
+    print_banner(label_for_core(core))
 
     return pytest.main(list(runner_args))
 
 
-def run_tests_with_coverage(tracer, *runner_args):
+def run_tests_with_coverage(core, *runner_args):
     """Run tests, but with coverage."""
     # Need to define this early enough that the first import of env.py sees it.
     os.environ["COVERAGE_TESTING"] = "True"
@@ -172,7 +177,7 @@ def run_tests_with_coverage(tracer, *runner_args):
     if context:
         if context[0] == "$":
             context = os.environ[context[1:]]
-        os.environ["COVERAGE_CONTEXT"] = context + "." + tracer
+        os.environ["COVERAGE_CONTEXT"] = context + "." + core
 
     # Create the .pth file that will let us measure coverage in sub-processes.
     # The .pth file seems to have to be alphabetically after easy-install.pth
@@ -183,7 +188,7 @@ def run_tests_with_coverage(tracer, *runner_args):
     with open(pth_path, "w") as pth_file:
         pth_file.write("import coverage; coverage.process_startup()\n")
 
-    suffix = f"{make_env_id(tracer)}_{platform.platform()}"
+    suffix = f"{make_env_id(core)}_{platform.platform()}"
     os.environ["COVERAGE_METAFILE"] = os.path.abspath(".metacov." + suffix)
 
     import coverage
@@ -211,7 +216,7 @@ def run_tests_with_coverage(tracer, *runner_args):
         sys.modules.update(covmods)
 
         # Run tests, with the arguments from our command line.
-        status = run_tests(tracer, *runner_args)
+        status = run_tests(core, *runner_args)
 
     finally:
         cov.stop()
@@ -240,19 +245,19 @@ def do_combine_html():
     cov.html_report(show_contexts=show_contexts)
 
 
-def do_test_with_tracer(tracer, *runner_args):
-    """Run tests with a particular tracer."""
+def do_test_with_core(core, *runner_args):
+    """Run tests with a particular core."""
     # If we should skip these tests, skip them.
-    skip_msg = should_skip(tracer)
+    skip_msg = should_skip(core)
     if skip_msg:
         print(skip_msg)
         return None
 
-    os.environ["COVERAGE_TEST_TRACER"] = tracer
+    os.environ["COVERAGE_CORE"] = core
     if os.environ.get("COVERAGE_COVERAGE", "no") == "yes":
-        return run_tests_with_coverage(tracer, *runner_args)
+        return run_tests_with_coverage(core, *runner_args)
     else:
-        return run_tests(tracer, *runner_args)
+        return run_tests(core, *runner_args)
 
 
 def do_zip_mods():
