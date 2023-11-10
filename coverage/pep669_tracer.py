@@ -15,20 +15,30 @@ import re
 import sys
 import threading
 import traceback
+import weakref
 
 from types import CodeType, FrameType, ModuleType
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
-#from coverage.debug import short_stack
 from coverage.types import (
     TArc, TFileDisposition, TLineNo, TTraceData, TTraceFileData, TTraceFn,
     TTracer, TWarnFn,
 )
 
-# When running meta-coverage, this file can try to trace itself, which confuses
-# everything.  Don't trace ourselves.
 
-THIS_FILE = __file__.rstrip("co")
+class LoggingWrapper:
+    def __init__(self, wrapped, namespace):
+        self.wrapped = wrapped
+        self.namespace = namespace
+
+    def __getattr__(self, name):
+        def _wrapped(*args, **kwargs):
+            log(f"{self.namespace}.{name}{args}{kwargs}")
+            return getattr(self.wrapped, name)(*args, **kwargs)
+        return _wrapped
+
+#sys_monitoring = LoggingWrapper(sys.monitoring, "sys.monitoring")
+sys_monitoring = getattr(sys, "monitoring", None)
 
 seen_threads = set()
 
@@ -37,7 +47,7 @@ def log(msg):
     # Thread ids are reused across processes? Make a shorter number more likely
     # to be unique.
     pid = os.getpid()
-    tid = (os.getpid() * threading.current_thread().ident) % 9_999_991
+    tid = (pid * threading.current_thread().ident) % 9_999_991
     tid = f"{tid:07d}"
     if tid not in seen_threads:
         seen_threads.add(tid)
@@ -55,7 +65,7 @@ FILENAME_REGEXES = [
 ]
 FILENAME_SUBS = []
 
-def fname_repr(filename):
+def short_fname(filename):
     if not FILENAME_SUBS:
         for pathdir in sys.path:
             FILENAME_SUBS.append((pathdir, "syspath:"))
@@ -67,38 +77,41 @@ def fname_repr(filename):
             filename = re.sub(pat, sub, filename)
         for before, after in FILENAME_SUBS:
             filename = filename.replace(before, after)
-    return repr(filename)
+    return filename
 
 def arg_repr(arg):
     if isinstance(arg, CodeType):
-        arg_repr = f"<name={arg.co_name}, file={fname_repr(arg.co_filename)}#{arg.co_firstlineno}>"
+        arg_repr = f"<code @{id(arg):#x} name={arg.co_name}, file={short_fname(arg.co_filename)!r}#{arg.co_firstlineno}>"
     else:
         arg_repr = repr(arg)
     return arg_repr
 
 def short_stack(full=True):
     stack: Iterable[inspect.FrameInfo] = inspect.stack()[::-1]
-    return "\n".join(f"{fi.function:>30s} : 0x{id(fi.frame):x} {fi.filename}:{fi.lineno}" for fi in stack)
+    return "\n".join(f"{fi.function:>30s} : {id(fi.frame):#x} {short_fname(fi.filename)}:{fi.lineno}" for fi in stack)
 
 def panopticon(*names):
     def _decorator(meth):
         def _wrapped(self, *args):
             try:
                 # log("stack:\n" + short_stack())
-                # args_reprs = []
-                # for name, arg in zip(names, args):
-                #     if name is None:
-                #         continue
-                #     args_reprs.append(f"{name}={arg_repr(arg)}")
-                # log(f"{id(self)}:{meth.__name__}({', '.join(args_reprs)})")
+                args_reprs = []
+                for name, arg in zip(names, args):
+                    if name is None:
+                        continue
+                    args_reprs.append(f"{name}={arg_repr(arg)}")
+                log(f"{id(self):#x}:{meth.__name__}({', '.join(args_reprs)})")
                 ret = meth(self, *args)
-                # log(f" end {id(self)}:{meth.__name__}({', '.join(args_reprs)})")
+                #log(f" end {id(self):#x}:{meth.__name__}({', '.join(args_reprs)})")
                 return ret
             except Exception as exc:
-                log(f"{exc.__class__.__name__}: {exc}")
-                with open("/tmp/pan.out", "a") as f:
-                    traceback.print_exception(exc, file=f)
-                sys.monitoring.set_events(sys.monitoring.COVERAGE_ID, 0)
+                log(f"!!{exc.__class__.__name__}: {exc}")
+                log("".join(traceback.format_exception(exc)))
+                try:
+                    sys_monitoring.set_events(sys.monitoring.COVERAGE_ID, 0)
+                except ValueError:
+                    # We might have already shut off monitoring.
+                    log(f"oops, shutting off events with disabled tool id")
                 raise
         return _wrapped
     return _decorator
@@ -126,7 +139,8 @@ class Pep669Tracer(TTracer):
     # One of these will be used across threads. Be careful.
 
     def __init__(self) -> None:
-        log(f"Pep669Tracer.__init__: @{id(self)}\n{short_stack()}")
+        test_name = os.environ.get("PYTEST_CURRENT_TEST", "no-test")
+        log(f"Pep669Tracer.__init__: @{id(self):#x} in {test_name}\n{short_stack()}")
         # pylint: disable=super-init-not-called
         # Attributes set from the collector:
         self.data: TTraceData
@@ -137,16 +151,14 @@ class Pep669Tracer(TTracer):
         self.switch_context: Optional[Callable[[Optional[str]], None]] = None
         self.warn: TWarnFn
 
-        # The threading module to use, if any.
-        self.threading: Optional[ModuleType] = None
-
         self.code_infos: Dict[CodeType, CodeInfo] = {}
         self.last_lines: Dict[FrameType, int] = {}
+        self.local_event_codes = None
+
         self.stats = {
             "starts": 0,
         }
 
-        self.thread: Optional[threading.Thread] = None
         self.stopped = False
         self._activity = False
 
@@ -155,45 +167,40 @@ class Pep669Tracer(TTracer):
         atexit.register(setattr, self, "in_atexit", True)
 
     def __repr__(self) -> str:
-        me = id(self)
         points = sum(len(v) for v in self.data.values())
         files = len(self.data)
-        return f"<Pep669Tracer at 0x{me:x}: {points} data points in {files} files>"
+        return f"<Pep669Tracer at {id(self):#x}: {points} data points in {files} files>"
 
+    @panopticon()
     def start(self) -> TTraceFn:    # TODO: wrong return type
         """Start this Tracer."""
         self.stopped = False
-        if self.threading:
-            if self.thread is None:
-                self.thread = self.threading.current_thread()
-            else:
-                if self.thread.ident != self.threading.current_thread().ident:
-                    # Re-starting from a different thread!? Don't set the trace
-                    # function, but we are marked as running again, so maybe it
-                    # will be ok?
-                    1/0
-                    return self._cached_bound_method_trace
 
+        self.local_event_codes = weakref.WeakSet()
         self.myid = sys.monitoring.COVERAGE_ID
-        sys.monitoring.use_tool_id(self.myid, "coverage.py")
+        sys_monitoring.use_tool_id(self.myid, "coverage.py")
         events = sys.monitoring.events
-        sys.monitoring.set_events(
+        sys_monitoring.set_events(
             self.myid,
-            events.PY_START | events.PY_RETURN | events.PY_RESUME | events.PY_YIELD | events.PY_UNWIND,
+            events.PY_START | events.PY_UNWIND,
         )
-        sys.monitoring.register_callback(self.myid, events.PY_START, self.sysmon_py_start)
-        sys.monitoring.register_callback(self.myid, events.PY_RESUME, self.sysmon_py_resume)
-        sys.monitoring.register_callback(self.myid, events.PY_RETURN, self.sysmon_py_return)
-        sys.monitoring.register_callback(self.myid, events.PY_YIELD, self.sysmon_py_yield)
-        sys.monitoring.register_callback(self.myid, events.PY_UNWIND, self.sysmon_py_unwind)
-        sys.monitoring.register_callback(self.myid, events.LINE, self.sysmon_line)
-        sys.monitoring.register_callback(self.myid, events.BRANCH, self.sysmon_branch)
-        sys.monitoring.register_callback(self.myid, events.JUMP, self.sysmon_jump)
+        sys_monitoring.register_callback(self.myid, events.PY_START, self.sysmon_py_start)
+        sys_monitoring.register_callback(self.myid, events.PY_RESUME, self.sysmon_py_resume)
+        sys_monitoring.register_callback(self.myid, events.PY_RETURN, self.sysmon_py_return)
+        sys_monitoring.register_callback(self.myid, events.PY_YIELD, self.sysmon_py_yield)
+        sys_monitoring.register_callback(self.myid, events.PY_UNWIND, self.sysmon_py_unwind)
+        sys_monitoring.register_callback(self.myid, events.LINE, self.sysmon_line)
+        sys_monitoring.register_callback(self.myid, events.BRANCH, self.sysmon_branch)
+        sys_monitoring.register_callback(self.myid, events.JUMP, self.sysmon_jump)
 
+    @panopticon()
     def stop(self) -> None:
         """Stop this Tracer."""
-        sys.monitoring.set_events(self.myid, 0)
-        sys.monitoring.free_tool_id(self.myid)
+        sys_monitoring.set_events(self.myid, 0)
+        for code in self.local_event_codes:
+            sys_monitoring.set_local_events(self.myid, code, 0)
+        self.local_event_codes = None
+        sys_monitoring.free_tool_id(self.myid)
 
     def activity(self) -> bool:
         """Has there been any activity?"""
@@ -255,19 +262,20 @@ class Pep669Tracer(TTracer):
 
             if tracing_code:
                 events = sys.monitoring.events
-                log(f"set_local_events(code={arg_repr(code)})")
-                sys.monitoring.set_local_events(
+                sys_monitoring.set_local_events(
                     self.myid,
                     code,
-                    sys.monitoring.events.LINE |
-                    sys.monitoring.events.BRANCH |
-                    sys.monitoring.events.JUMP,
+                    events.PY_RETURN | events.PY_RESUME | events.PY_YIELD |
+                    events.LINE |
+                    events.BRANCH |
+                    events.JUMP,
                 )
+                self.local_event_codes.add(code)
 
         if tracing_code:
             frame = self.callers_frame()
             self.last_lines[frame] = -code.co_firstlineno
-        log(f"   {file_data=}")
+        #log(f"   {file_data=}")
 
     @panopticon("code", "@")
     def sysmon_py_resume(self, code, instruction_offset: int):
@@ -282,10 +290,10 @@ class Pep669Tracer(TTracer):
             if self.trace_arcs:
                 arc = (self.last_lines[frame], -code.co_firstlineno)
                 cast(Set[TArc], code_info.file_data).add(arc)
-                log(f"   add1({arc=})")
+                #log(f"   add1({arc=})")
 
         # Leaving this function, no need for the frame any more.
-        log(f"   popping frame 0x{id(frame):x}")
+        #log(f"   popping frame {id(frame):#x}")
         self.last_lines.pop(frame, None)
 
     @panopticon("code", "@", None)
@@ -300,29 +308,38 @@ class Pep669Tracer(TTracer):
             if self.trace_arcs:
                 arc = (self.last_lines[frame], -code.co_firstlineno)
                 cast(Set[TArc], code_info.file_data).add(arc)
-                log(f"   add3({arc=})")
+                #log(f"   add3({arc=})")
 
         # Leaving this function.
         self.last_lines.pop(frame, None)
 
     @panopticon("code", "line")
     def sysmon_line(self, code, line_number: int):
-        frame = self.callers_frame()
         code_info = self.code_infos[code]
+        if not code_info.tracing:
+            log("DISABLE")
+            return sys.monitoring.DISABLE
         if code_info.file_data is not None:
+            frame = self.callers_frame()
             if self.trace_arcs:
                 arc = (self.last_lines[frame], line_number)
                 cast(Set[TArc], code_info.file_data).add(arc)
-                log(f"   add4({arc=})")
+                #log(f"   add4({arc=})")
             else:
                 cast(Set[TLineNo], code_info.file_data).add(line_number)
-                log(f"   add5({line_number=})")
+                #log(f"   add5({line_number=})")
             self.last_lines[frame] = line_number
 
     @panopticon("code", "from@", "to@")
     def sysmon_branch(self, code, instruction_offset: int, destination_offset: int):
-        ...
+        code_info = self.code_infos[code]
+        if not code_info.tracing:
+            log("DISABLE")
+            return sys.monitoring.DISABLE
 
     @panopticon("code", "from@", "to@")
     def sysmon_jump(self, code, instruction_offset: int, destination_offset: int):
-        ...
+        code_info = self.code_infos[code]
+        if not code_info.tracing:
+            log("DISABLE")
+            return sys.monitoring.DISABLE
