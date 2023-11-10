@@ -23,6 +23,7 @@ from coverage import env
 from coverage.data import line_counts
 from coverage.files import abs_file, python_reported_file
 
+from tests import testenv
 from tests.coveragetest import CoverageTest, TESTS_DIR
 from tests.helpers import re_lines_text
 
@@ -516,7 +517,7 @@ class ProcessTest(CoverageTest):
         assert py_out == "None\n"
 
         cov_out = self.run_command("coverage run showtrace.py")
-        if os.environ.get('COVERAGE_TEST_TRACER', 'c') == 'c':
+        if testenv.C_TRACER:
             # If the C trace function is being tested, then regular running should have
             # the C function, which registers itself as f_trace.
             assert cov_out == "CTracer\n"
