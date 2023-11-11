@@ -21,7 +21,7 @@ from coverage.debug import short_stack
 from coverage.disposition import FileDisposition
 from coverage.exceptions import ConfigError
 from coverage.misc import human_sorted_items, isolate_module
-from coverage.pep669_tracer import Pep669Tracer
+from coverage.pep669_monitor import Pep669Monitor
 from coverage.plugin import CoveragePlugin
 from coverage.pytracer import PyTracer
 from coverage.types import (
@@ -153,7 +153,7 @@ class Collector:
                     core = "ctrace"
 
         if core == "sysmon":
-            self._trace_class = Pep669Tracer
+            self._trace_class = Pep669Monitor
             self.file_disposition_class = FileDisposition
             self.supports_plugins = False
             self.packed_arcs = False
